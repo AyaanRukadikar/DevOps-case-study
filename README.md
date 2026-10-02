@@ -1,4 +1,4 @@
-# attendance-devops-ca2
+# devopscase-case-study-ca2
 
 Small Node.js (Express) service used for the CA-II DevOps practical: CI/CD with GitHub Actions,
 Ansible host setup, Docker + Kubernetes, and Prometheus + Grafana monitoring.
