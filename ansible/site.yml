@@ -1,0 +1,84 @@
+- name: Prepare host and run attendance-api
+  hosts: app_servers
+  become: true
+  vars:
+    app_user: deploy
+    app_dir: /opt/attendance-api
+    app_version: "1"
+    image_name: attendance-api
+    source_files:
+      - package.json
+      - package-lock.json
+      - app.js
+      - server.js
+      - Dockerfile
+  tasks:
+    - name: Install required packages
+      ansible.builtin.apt:
+        name: [docker.io, python3-docker, curl]
+        state: present
+        update_cache: true
+
+    - name: Make sure the Docker service is running and enabled
+      ansible.builtin.service:
+        name: docker
+        state: started
+        enabled: true
+
+    - name: Create the application user (member of the docker group)
+      ansible.builtin.user:
+        name: "{{ app_user }}"
+        groups: docker
+        append: true
+        shell: /bin/bash
+
+    - name: Create the application directory
+      ansible.builtin.file:
+        path: "{{ app_dir }}"
+        state: directory
+        owner: "{{ app_user }}"
+        mode: "0750"
+
+    - name: Copy application source files
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../{{ item }}"
+        dest: "{{ app_dir }}/{{ item }}"
+        owner: "{{ app_user }}"
+        mode: "0640"
+      loop: "{{ source_files }}"
+
+    - name: Render the environment file from the template
+      ansible.builtin.template:
+        src: app.env.j2
+        dest: "{{ app_dir }}/app.env"
+        owner: "{{ app_user }}"
+        mode: "0640"
+
+    - name: Build the Docker image on the host
+      community.docker.docker_image:
+        name: "{{ image_name }}"
+        tag: "{{ app_version }}"
+        source: build
+        build:
+          path: "{{ app_dir }}"
+          args:
+            APP_VERSION: "{{ app_version }}"
+
+    - name: Run the attendance-api container
+      community.docker.docker_container:
+        name: attendance-api
+        image: "{{ image_name }}:{{ app_version }}"
+        state: started
+        restart_policy: always
+        env_file: "{{ app_dir }}/app.env"
+        ports:
+          - "3000:3000"
+
+    - name: Wait until the service answers on /healthz
+      ansible.builtin.uri:
+        url: http://localhost:3000/healthz
+        status_code: 200
+      register: health
+      retries: 10
+      delay: 3
+      until: health.status == 200

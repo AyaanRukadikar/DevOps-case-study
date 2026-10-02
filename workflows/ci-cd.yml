@@ -1,0 +1,87 @@
+name: ci-cd
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  # ---------- Job 1: run the unit tests (on pull requests and on main) ----------
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm test
+
+  # ---------- Job 2: build the image and publish it to GitHub Container Registry ----------
+  build-and-push:
+    needs: test
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set lowercase image name
+        run: echo "IMAGE_BASE=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/attendance-api" >> "$GITHUB_ENV"
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.IMAGE_BASE }}:${{ github.sha }}
+            ${{ env.IMAGE_BASE }}:latest
+
+  # ---------- Job 3: deploy to Kubernetes and prove it works ----------
+  # A throw-away kind (Kubernetes-in-Docker) cluster is created inside the runner,
+  # so no external cluster or credentials are needed. The exact image published
+  # in Job 2 is pulled, deployed with a rolling update, and smoke-tested.
+  deploy:
+    needs: build-and-push
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set lowercase image name
+        run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/attendance-api:${GITHUB_SHA}" >> "$GITHUB_ENV"
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Pull the image published by the previous job
+        run: docker pull "$IMAGE"
+      - uses: helm/kind-action@v1
+        with:
+          cluster_name: ci
+      - name: Load the image into the cluster
+        run: kind load docker-image "$IMAGE" --name ci
+      - name: Deploy manifests (image tag replaced with this commit)
+        run: |
+          sed "s|image: attendance-api:v1|image: ${IMAGE}|" k8s/deployment.yaml | kubectl apply -f -
+          kubectl apply -f k8s/service.yaml
+          kubectl rollout status deployment/attendance-api --timeout=120s
+      - name: Smoke test through the Service
+        run: |
+          kubectl port-forward svc/attendance-api 8080:80 &
+          sleep 5
+          curl --fail --silent http://localhost:8080/healthz
+          curl --fail --silent http://localhost:8080/attendance
+      - name: Show cluster state
+        if: always()
+        run: kubectl get deploy,pods,svc -o wide
